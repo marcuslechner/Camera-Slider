@@ -1,0 +1,17 @@
+# Ignore these
+*.MP4
+*.PNG
+*.mkv
+*.mov
+*.STL
+*.gcode
+*.PDF
+*.xlsx
+*.docx
+*.jpg
+*.zip
+*.gif
+*.avi
+
+#Directories
+TMCStepper-master/
