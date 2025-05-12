@@ -99,7 +99,7 @@ void setup()
   linearDriver.intpol (true);         //enables interpolation
   linearDriver.en_spreadCycle (false); //Spread Cycle enabled. offers smooth and quiet operation
   linearDriver.mstep_reg_select(true);  //Microsteps set by the registers
-
+`
   //PAN STEPPER
   panDriver.pdn_disable(true);     // Use PDN/UART pin for communication
   panDriver.I_scale_analog(false); // Use internal voltage reference
