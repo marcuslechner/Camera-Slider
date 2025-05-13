@@ -3,10 +3,10 @@
 
 **An open-source, precision motorized camera slider** engineered with NEMA 23 stepper motors, Trinamic TMC2208 drivers, and robust aluminum extrusion rails. This high-performance build is powered by embedded C++ firmware running on an Arduino-compatible board, offering smooth motion control for cinematic shots and timelapses.
 
-📺 **Watch the full build video:**  
-[![Watch on YouTube](https://img.shields.io/badge/Watch%20Video-%F0%9F%8E%A5-red?logo=youtube)](https://www.youtube.com/watch?v=-9Q4Nq9MRP0)
+📺 **Click to watch the full build video below:**  
+[![Watch on YouTube](https://img.youtube.com/vi/QBlhba4QOJE/hqdefault.jpg)](https://youtu.be/QBlhba4QOJE)
 
-![Camera Slider Thumbnail](assets/camera_slider_thumbnail.png)
+[![Watch on YouTube](https://img.shields.io/badge/Watch%20Video-%F0%9F%8E%A5-red?logo=youtube)](https://www.youtube.com/watch?v=-9Q4Nq9MRP0)
 
 ---
 
