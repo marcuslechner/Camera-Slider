@@ -1,58 +1,88 @@
-//Marcus Lechner
-//Help from mahmud
-//                                                                                                                                                                                                                                                                                             
-//efficient setup speeds
-//less use of code. Plan on using setelect Beta and select posB twice with return of a long. dialog will be set in the regular mode and timelapse mode functoins
-//why negfative multi
+/*
+  Project: Motorized Camera Slider
+  Author: Marcus Lechner
+  Original Date: July 17, 2019
+  Refactored: May 12, 2025
 
-#define TX_LIN    2  // BLUE, RES
-#define RX_LIN    3  // GREEN
-#define TX_PAN    4  // BLUE, RES
-#define RX_PAN    5  // GREEN
-#define STEP_LIN  10 // Step on rising edge
-#define STEP_PAN  11 // Step on rising edge
-#define knobCLK   8
-#define knobDT    9
-#define EN_LIN    6  // LOW: Driver enabled. HIGH: Driver disabled
-#define EN_PAN    7  // LOW: Driver enabled. HIGH: Driver disabled
+  Overview:
+  A two-axis motion control system for a camera slider using NEMA 23 stepper motors 
+  and TMC2208 drivers. The system supports both real-time and time-lapse modes, 
+  with parameter selection via rotary encoder and feedback on a 128x32 OLED display.
 
-#include <TMC2208Stepper.h>
+  Refactor Summary:
+  - Full codebase restructured for clarity, modularity, and maintainability
+  - All key functions isolated, renamed, and documented
+  - Rotary encoder interaction unified and debounced
+  - OLED updates reduced for performance and readability
+  - Motion blending logic simplified and parameterized
+
+  Status:
+  This firmware has not yet been re-tested on hardware. The slider is currently with 
+  the person it was built for, so hardware validation is pending.
+
+  Future Improvements:
+  - Migrate motion sequencing to an RTOS (e.g. FreeRTOS, Zephyr) for precise timing, concurrency
+  - Replace soldered breadboard setup with a custom PCB for long-term durability and compact wiring
+  - Add soft limit detection, homing support, and dynamic acceleration profiles
+  - Modularize UI and motor control layers for reuse across other motion systems
+
+  Key Technologies:
+  - TMC2208 stepper drivers (UART via SoftwareSerial)
+  - SSD1306 OLED display (I2C)
+  - Rotary encoder and push-button UI (GPIO-based)
+  - Motion blending using integer multipliers (no floating point in loop)
+
+  Communication Protocols:
+  - UART: Motor driver configuration and control
+  - I2C: OLED status display communication
+  - GPIO: Rotary encoder, step and enable control lines
+*/
+
+// ---------------------------
+// Includes and Definitions
+// ---------------------------
 #include <Arduino.h>
+#include <TMC2208Stepper.h>
 #include <U8x8lib.h>
-
 #ifdef U8X8_HAVE_HW_SPI
 #include <SPI.h>
 #endif
 
+// Pin definitions
+#define TX_LIN     2
+#define RX_LIN     3
+#define TX_PAN     4
+#define RX_PAN     5
+#define STEP_LIN   10
+#define STEP_PAN   11
+#define EN_LIN     6
+#define EN_PAN     7
+#define knobCLK    8
+#define knobDT     9
+#define knobBtn    A0
+#define panDir     A1
+
+
+// Display
 U8X8_SSD1306_128X32_UNIVISION_HW_I2C u8x8(/* reset=*/ U8X8_PIN_NONE); 
 
-
-// Create driver that uses SoftwareSerial for communication
+// Motor Drivers
 TMC2208Stepper linearDriver = TMC2208Stepper(RX_LIN, TX_LIN);
 TMC2208Stepper panDriver = TMC2208Stepper(RX_PAN, TX_PAN);
 
-int prevValue = 50;
-int speedSelect = 0;
-long del = 0;
-long counter = 4;
-int value = 2;
-int currentStateCLK;
-int previousStateCLK;
-long i = 0;
+// Motion state
 long posA = 0;
 long alpha = 0;
-long stepsLeft = 0;
-long stepsDone = 0;
-int multiplier1 = 0;
-int multiplier2 = 0;
-int multiplier3 = 0;
-int multiplier4 = 0;
-int multiplier5 = 0;
-//long stepLin = 0;
-//long stepPan = 0;
-//long timingN = 0;
-//long timingO = 0;
+long del = 0;
 float hours = 0.00;
+
+// Encoder state
+int counter = 4;
+int value = 2;
+int prevValue = 50;
+int currentStateCLK;
+int previousStateCLK;
+
 
 void regularMode();
 void moveMode();
@@ -66,976 +96,739 @@ void timeLapseMode();
 void selectMode();
 void currentState();
 
-void setup() 
-{  
-  u8x8.begin();
-  u8x8.setPowerSave(0);
-  u8x8.setFont(u8x8_font_8x13_1x2_f);
-  u8x8.clear();
-  u8x8.drawString(0,0,"Starting up the");
-  u8x8.drawString(0,2,"Lechner Slider");
-  
-  Serial.begin(9600);
-  linearDriver.beginSerial(115200);
-  panDriver.beginSerial(115200);
-  // Push at the start of setting up the driver resets the register to default
-  linearDriver.push();
-  panDriver.push();
-  // Prepare pins
 
-  pinMode(EN_LIN, OUTPUT);
-  pinMode(EN_PAN, OUTPUT);
-  pinMode(STEP_LIN, OUTPUT);
-  pinMode(STEP_PAN, OUTPUT);
-  pinMode (knobCLK, INPUT);
-  pinMode (knobDT, INPUT);
-  pinMode (A0, INPUT);
+void setupDisplay()
+{
+    u8x8.begin();
+    u8x8.setPowerSave(0);
+    u8x8.setFont(u8x8_font_8x13_1x2_f);
+    u8x8.clear();
+    u8x8.drawString(0, 0, "Starting up the");
+    u8x8.drawString(0, 2, "Lechner Slider");
+}
 
-  //LINEAR STEPPER
-  linearDriver.pdn_disable(true);     // Use PDN/UART pin for communication
-  linearDriver.I_scale_analog(false); // Use internal voltage reference
-  linearDriver.rms_current(1100);      // Set linearDriver current = 500mA, 0.5 multiplier for hold current and RSENSE = 0.11.
-  linearDriver.toff(2);               // Enable driver in software
-  linearDriver.intpol (true);         //enables interpolation
-  linearDriver.en_spreadCycle (false); //Spread Cycle enabled. offers smooth and quiet operation
-  linearDriver.mstep_reg_select(true);  //Microsteps set by the registers
-`
-  //PAN STEPPER
-  panDriver.pdn_disable(true);     // Use PDN/UART pin for communication
-  panDriver.I_scale_analog(false); // Use internal voltage reference
-  panDriver.rms_current(1100);      // Set panDriver current = 500mA, 0.5 multiplier for hold current and RSENSE = 0.11.
-  panDriver.toff(2);               // Enable driver in software
-  panDriver.intpol (true);
-  panDriver.en_spreadCycle (false);
-  panDriver.mstep_reg_select(true);
+void setupDrivers()
+{
+    linearDriver.beginSerial(115200);
+    panDriver.beginSerial(115200);
+    linearDriver.push();
+    panDriver.push();
 
-  digitalWrite(EN_LIN, LOW);    // Enable driver in hardware
-  digitalWrite(EN_PAN, LOW); 
-  digitalWrite(A1, LOW);
-  digitalWrite(A1, LOW);
-  delay(3000);
+    linearDriver.pdn_disable(true);
+    linearDriver.I_scale_analog(false);
+    linearDriver.rms_current(1100);
+    linearDriver.toff(2);
+    linearDriver.intpol(true);
+    linearDriver.en_spreadCycle(false);
+    linearDriver.mstep_reg_select(true);
 
-  linearDriver.shaft(false);
-  //panDriver.shaft(true);
+    panDriver.pdn_disable(true);
+    panDriver.I_scale_analog(false);
+    panDriver.rms_current(1100);
+    panDriver.toff(2);
+    panDriver.intpol(true);
+    panDriver.en_spreadCycle(false);
+    panDriver.mstep_reg_select(true);
 
-  previousStateCLK = digitalRead(knobCLK);
-  Serial.println("Set up Done!");
+    digitalWrite(EN_LIN, LOW);
+    digitalWrite(EN_PAN, LOW);
+    digitalWrite(panDir, LOW);
+
+    delay(1000);
+    linearDriver.shaft(false);
+}
+
+void setupPins()
+{
+    pinMode(EN_LIN, OUTPUT);
+    pinMode(EN_PAN, OUTPUT);
+    pinMode(STEP_LIN, OUTPUT);
+    pinMode(STEP_PAN, OUTPUT);
+    pinMode(knobCLK, INPUT);
+    pinMode(knobDT, INPUT);
+    pinMode(knobBtn, INPUT);
+    pinMode(panDir, OUTPUT);
+}
+
+void setup()
+{
+    Serial.begin(9600);
+    setupDisplay();
+    setupPins();
+    setupDrivers();
+
+    previousStateCLK = digitalRead(knobCLK);
+    Serial.println("Setup complete.");
+    delay(1000);
 }
 
 void loop() 
 {
   selectMode();
 }
+
 void selectMode()
 {
-  u8x8.clear();
-  u8x8.drawString(0,0,"Select a Mode:");
-  counter = 0;
-  value = 0;
-  value = prevValue;
-  prevValue = 0;
-  while(1)
-  {
-    currentStateCLK = digitalRead(knobCLK);
-     
-    if (currentStateCLK != previousStateCLK)
-    {
-      if(digitalRead(knobDT) == currentStateCLK)
-      {
-          counter++;
-      }  
-      if(digitalRead(knobDT) != currentStateCLK)
-      { 
-          counter--;
-      }
-      value = counter / 2;
+    const int MODE_MIN = 1;
+    const int MODE_MAX = 2;
 
-      if(value < 1)
-      {
-        counter = 1 * 2;
-        value = counter / 2;
-      }
-      if(value >= 2)
-      {
-        counter = 4;
-        value = counter / 2;
-      }
-    }
-    
-    previousStateCLK = currentStateCLK;
+    u8x8.clear();
+    u8x8.drawString(0, 0, "Select a Mode:");
 
-    if(value!= prevValue)
+    counter = 0;
+    value = prevValue;
+    prevValue = 0;
+
+    while (true)
     {
-      if(value == 1)
-      {
-        //hours = (float)value * 0.25;
-        u8x8.clearLine(2);
-        u8x8.clearLine(3);
-        u8x8.setCursor(0,2);
-        u8x8.print("1. Slide and Pan");
-      }
-      if(value == 2)
-      {
-        //hours = (float)value * 0.25;
-        u8x8.clearLine(2);
-        u8x8.clearLine(3);
-        u8x8.setCursor(0,2);
-        u8x8.print("2. Time Lapse");
-      }
+        currentStateCLK = digitalRead(knobCLK);
+
+        if (currentStateCLK != previousStateCLK)
+        {
+            // Encoder logic: increment or decrement based on direction
+            if (digitalRead(knobDT) == currentStateCLK)
+            {
+                counter++;
+            }
+            else
+            {
+                counter--;
+            }
+
+            // Clamp the value between available options
+            value = counter / 2;
+            value = constrain(value, MODE_MIN, MODE_MAX);
+            counter = value * 2;
+        }
+
+        previousStateCLK = currentStateCLK;
+
+        if (value != prevValue)
+        {
+            u8x8.clearLine(2);
+            u8x8.clearLine(3);
+            u8x8.setCursor(0, 2);
+
+            switch (value)
+            {
+                case 1:
+                    u8x8.print("1. Slide and Pan");
+                    break;
+                case 2:
+                    u8x8.print("2. Time Lapse");
+                    break;
+                default:
+                    break;
+            }
+
+            prevValue = value;
+        }
+
+        // Confirm selection on button press
+        if (digitalRead(knobBtn) == LOW)
+        {
+            delay(500);  // Debounce delay
+
+            if (value == 1)
+            {
+                regularMode();
+            }
+            else if (value == 2)
+            {
+                timeLapseMode();
+            }
+
+            return;
+        }
     }
-    prevValue = value;
-    if (digitalRead(A0) == 0)
-    { 
-      if(value == 1)
-      {
-        delay(500);
-        regularMode();
-      }
-      if(value == 2)
-      {
-        delay(500);
-        timeLapseMode();
-      }
-      return(0);
-    }
-  }
 }
+
+
 void regularMode()
 {
-  selectB();
-  selectBeta();
-  selectA();
-  selectAlpha();
-  selectSpeed();
-  moveMode();
-  selectMode();
+    // Step through full interactive configuration for real-time movement
+    selectB();        // Set end position (linear)
+    selectBeta();     // Set end angle (pan)
+    selectA();        // Set start position (linear)
+    selectAlpha();    // Set start angle (pan)
+    selectSpeed();    // Choose motion speed
+    moveMode();       // Execute calculated move
+    selectMode();     // Return to mode selection menu
 }
+
+
 void timeLapseMode()
 {
-  selectB();
-  selectBeta();
-  selectA();
-  selectAlpha();
-  selectTime();
-  moveMode();
-  selectMode();
+    // Step through full configuration for timelapse capture mode
+    selectB();         // Set end position (linear)
+    selectBeta();      // Set end angle (pan)
+    selectA();         // Set start position (linear)
+    selectAlpha();     // Set start angle (pan)
+    selectTime();      // Choose total time for timelapse
+    moveMode();        // Execute smooth timelapse motion
+    selectMode();      // Return to mode selection menu
 }
+
+
 void currentState()
 {
-  if(digitalRead(knobDT) == currentStateCLK)
-  {
-    counter--;
-  }  
-  if(digitalRead(knobDT) != currentStateCLK)
-  { 
-    counter++;
-  }
-  value = counter / 2;
-  
-  if(value < 1)
-  {
-    counter = 1 * 2;
+    // Read rotary encoder direction and update counter
+    if (digitalRead(knobDT) == currentStateCLK)
+    {
+        counter--;
+    }
+    else
+    {
+        counter++;
+    }
+
+    // Map encoder movement to a usable value range
     value = counter / 2;
-  }
-  if(value >= 3)
-  {
-    counter = 3 * 2;
-    value = counter / 2;
-  }
-  //Serial.print("Value: ");  Serial.println(value);
+
+    // Clamp to expected bounds for all selector functions
+    const int MIN_OPTION = 1;
+    const int MAX_OPTION = 3;
+
+    value = constrain(value, MIN_OPTION, MAX_OPTION);
+    counter = value * 2; // Keep counter aligned with clamped value
 }
+
 void selectB()
 {
-  linearDriver.microsteps (0); 
-  Serial.println("SELECTING POSITION B");
-  u8x8.clear();
-  u8x8.drawString(0,0,"Set End Pos:");
-  value = 2;
-  counter = 4;
-  while(1)
-  {
-    currentStateCLK = digitalRead(knobCLK);
-     
-    if (currentStateCLK != previousStateCLK)
+    Serial.println("SELECTING POSITION B");
+
+    linearDriver.microsteps(0);  // Coarse movement for positioning
+
+    u8x8.clear();
+    u8x8.drawString(0, 0, "Set End Pos:");
+
+    value = 2;
+    counter = value * 2;
+
+    while (true)
     {
-      currentState();
+        currentStateCLK = digitalRead(knobCLK);
+
+        if (currentStateCLK != previousStateCLK)
+        {
+            currentState();
+        }
+
+        previousStateCLK = currentStateCLK;
+
+        // Forward direction
+        if (value == 1)
+        {
+            u8x8.clearLine(2);
+            u8x8.drawString(0, 2, "Right");
+
+            linearDriver.shaft(true);
+
+            while (value == 1)
+            {
+                currentStateCLK = digitalRead(knobCLK);
+                if (currentStateCLK != previousStateCLK)
+                {
+                    currentState();
+                }
+
+                digitalWrite(STEP_LIN, HIGH);
+                digitalWrite(STEP_LIN, LOW);
+
+                previousStateCLK = currentStateCLK;
+            }
+        }
+
+        // Reverse direction
+        if (value == 3)
+        {
+            u8x8.clearLine(2);
+            u8x8.drawString(0, 2, "Left");
+
+            linearDriver.shaft(false);
+
+            while (value == 3)
+            {
+                currentStateCLK = digitalRead(knobCLK);
+                if (currentStateCLK != previousStateCLK)
+                {
+                    currentState();
+                }
+
+                digitalWrite(STEP_LIN, HIGH);
+                digitalWrite(STEP_LIN, LOW);
+
+                previousStateCLK = currentStateCLK;
+            }
+        }
+
+        // Confirm selection
+        if (digitalRead(knobBtn) == LOW)
+        {
+            posA = 0;  // Mark new reference position
+            Serial.print("POSITION B SET\n");
+            delay(500);
+            return;
+        }
     }
-    previousStateCLK = currentStateCLK;
-    
-  //FORWARD
-    if(value == 1)
-    {
-      u8x8.clearLine(2);
-      u8x8.clearLine(3);
-      u8x8.drawString(0,2,"Right");
-    }
-    while(value == 1)
-    {
-      linearDriver.shaft(true);
-      currentStateCLK = digitalRead(knobCLK);
-      
-      if (currentStateCLK != previousStateCLK)
-      {
-        currentState();
-      }
-      //Serial.print("NOW ");  Serial.println(value);
-      digitalWrite(STEP_LIN, HIGH);
-      //delayMicroseconds(del);
-      digitalWrite(STEP_LIN, LOW);
-      previousStateCLK = currentStateCLK;
-    }
-  
-  //REVERSE
-    if(value == 3)
-    {
-      u8x8.clearLine(2);
-      u8x8.clearLine(3);
-      u8x8.drawString(0,2,"Left");
-    }
-    while(value == 3)
-    {
-      linearDriver.shaft(false);
-      currentStateCLK = digitalRead(knobCLK);
-      
-      if (currentStateCLK != previousStateCLK)
-      {
-        currentState();
-      }
-      //Serial.print("Value: ");  Serial.println(value);
-      digitalWrite(STEP_LIN, HIGH);
-      //delayMicroseconds(del);
-      digitalWrite(STEP_LIN, LOW);
-      previousStateCLK = currentStateCLK;
-    }
-    if (digitalRead(A0) == 0)
-    { 
-      posA = 0;
-      Serial.print("POSITION A: "); Serial.println(posA);
-      delay(500);
-      //selectBeta();
-      return(0);
-    }
-  }
 }
+
 void selectBeta()
 {
-  Serial.println("SELECTING ANGLE BETA");
-  u8x8.clear();
-  u8x8.drawString(0,0,"Set End Angle:");
-  value = 2;
-  counter = 4;
-  
-  while(1)
-  {
-     panDriver.microsteps (16);
-      //Serial.println("waiting");
-     currentStateCLK = digitalRead(knobCLK);
-    
-    if (currentStateCLK != previousStateCLK)
+    Serial.println("SELECTING ANGLE BETA");
+
+    panDriver.microsteps(16);  // Coarse angular positioning
+
+    u8x8.clear();
+    u8x8.drawString(0, 0, "Set End Angle:");
+
+    value = 2;
+    counter = value * 2;
+
+    while (true)
     {
-      currentState();
+        currentStateCLK = digitalRead(knobCLK);
+
+        if (currentStateCLK != previousStateCLK)
+        {
+            currentState();
+        }
+
+        previousStateCLK = currentStateCLK;
+
+        // Clockwise rotation
+        if (value == 1)
+        {
+            u8x8.clearLine(2);
+            u8x8.drawString(0, 2, "Clockwise");
+
+            panDriver.shaft(false);
+
+            while (value == 1)
+            {
+                currentStateCLK = digitalRead(knobCLK);
+                if (currentStateCLK != previousStateCLK)
+                {
+                    currentState();
+                }
+
+                digitalWrite(STEP_PAN, HIGH);
+                digitalWrite(STEP_PAN, LOW);
+
+                previousStateCLK = currentStateCLK;
+            }
+        }
+
+        // Counter-clockwise rotation
+        if (value == 3)
+        {
+            u8x8.clearLine(2);
+            u8x8.drawString(0, 2, "Anti-Clockwise");
+
+            panDriver.shaft(true);
+
+            while (value == 3)
+            {
+                currentStateCLK = digitalRead(knobCLK);
+                if (currentStateCLK != previousStateCLK)
+                {
+                    currentState();
+                }
+
+                digitalWrite(STEP_PAN, HIGH);
+                digitalWrite(STEP_PAN, LOW);
+
+                previousStateCLK = currentStateCLK;
+            }
+        }
+
+        // Confirm angle set
+        if (digitalRead(knobBtn) == LOW)
+        {
+            alpha = 0;  // End angle reference
+            Serial.println("ANGLE BETA SET");
+            delay(500);
+            return;
+        }
     }
-    previousStateCLK = currentStateCLK;
-
-//CLOCKWISE    
-  if(value == 1)
-  {
-    u8x8.clearLine(2);
-    u8x8.clearLine(3);
-    u8x8.drawString(0,2,"Clockwise");
-  }
-  while(value == 1)
-  {
-    panDriver.shaft(false);
-    currentStateCLK = digitalRead(knobCLK);
-    
-    if (currentStateCLK != previousStateCLK)
-    {
-      currentState();
-    }
-
-    digitalWrite(STEP_PAN, HIGH);
-    digitalWrite(STEP_PAN, LOW);
-
-    
-    previousStateCLK = currentStateCLK;
-  }
-
-//COUNTER CLOCKWISE
-  if(value == 3)
-  {
-    u8x8.clearLine(2);
-    u8x8.clearLine(3);
-    u8x8.drawString(0,2,"Anti-Clockwise");
-  }
-  while(value == 3)
-  {
-    panDriver.shaft(true);
-    currentStateCLK = digitalRead(knobCLK);
-    
-    if (currentStateCLK != previousStateCLK)
-    {
-      currentState();
-    }
-    
-    digitalWrite(STEP_PAN, HIGH);
-    digitalWrite(STEP_PAN, LOW);
-
-
-    previousStateCLK = currentStateCLK;
-  }
-  if (digitalRead(A0) == 0)
-  { 
-      alpha = 0;
-      Serial.print("ANGLE ALPHA A: "); Serial.println(alpha);
-      delay(500);
-      //selectA();
-      return(0);
-    }
-  }
 }
+
 void selectA()
 {
-  linearDriver.microsteps (0); 
-  Serial.println("SELECTING POSITION A");
-  u8x8.clear();
-  u8x8.drawString(0,0,"Set Start Pos:");
-  value = 2;
-  counter = 4;
-  while(1)
-  {
-    currentStateCLK = digitalRead(knobCLK);
-     
-    if (currentStateCLK != previousStateCLK)
-    {
-      currentState();
-    }
-    previousStateCLK = currentStateCLK;
-    
-  //FORWARD
-    if(value == 1)
-    {
-    u8x8.clearLine(2);
-    u8x8.clearLine(3);
-    u8x8.drawString(0,2,"Right");
-    }
-    while(value == 1)
-    {
-      linearDriver.shaft(true);
-      currentStateCLK = digitalRead(knobCLK);
-      
-      if (currentStateCLK != previousStateCLK)
-      {
-        currentState();
-      }
-      //Serial.print("NOW ");  Serial.println(value);
-      digitalWrite(STEP_LIN, HIGH);
-      //delayMicroseconds(del);
-      digitalWrite(STEP_LIN, LOW);
-      posA++;
-      previousStateCLK = currentStateCLK;
-    }
-  
-  //REVERSE
-    if(value == 3)
-    {
-      u8x8.clearLine(2);
-      u8x8.clearLine(3);
-      u8x8.drawString(0,2,"Left");
-    }
-    while(value == 3)
-    {
-      linearDriver.shaft(false);
-      currentStateCLK = digitalRead(knobCLK);
-      
-      if (currentStateCLK != previousStateCLK)
-      {
-        currentState();
-      }
-      //Serial.print("Value: ");  Serial.println(value);
-      digitalWrite(STEP_LIN, HIGH);
-      //delayMicroseconds(del);
-      digitalWrite(STEP_LIN, LOW);
-      previousStateCLK = currentStateCLK;
-      posA--;
-    }
-    if (digitalRead(A0) == 0)
-    { 
-      Serial.print("POSITION A: "); Serial.println(posA);
-      delay(500);
-      //selectAlpha();
-      return(0);
-    }
-  }
+    Serial.println("SELECTING POSITION A");
 
+    linearDriver.microsteps(0);  // Coarse movement for positioning
+
+    u8x8.clear();
+    u8x8.drawString(0, 0, "Set Start Pos:");
+
+    value = 2;
+    counter = value * 2;
+
+    while (true)
+    {
+        currentStateCLK = digitalRead(knobCLK);
+
+        if (currentStateCLK != previousStateCLK)
+        {
+            currentState();
+        }
+
+        previousStateCLK = currentStateCLK;
+
+        // Forward (Right)
+        if (value == 1)
+        {
+            u8x8.clearLine(2);
+            u8x8.drawString(0, 2, "Right");
+
+            linearDriver.shaft(true);
+
+            while (value == 1)
+            {
+                currentStateCLK = digitalRead(knobCLK);
+                if (currentStateCLK != previousStateCLK)
+                {
+                    currentState();
+                }
+
+                digitalWrite(STEP_LIN, HIGH);
+                digitalWrite(STEP_LIN, LOW);
+                posA++;
+
+                previousStateCLK = currentStateCLK;
+            }
+        }
+
+        // Reverse (Left)
+        if (value == 3)
+        {
+            u8x8.clearLine(2);
+            u8x8.drawString(0, 2, "Left");
+
+            linearDriver.shaft(false);
+
+            while (value == 3)
+            {
+                currentStateCLK = digitalRead(knobCLK);
+                if (currentStateCLK != previousStateCLK)
+                {
+                    currentState();
+                }
+
+                digitalWrite(STEP_LIN, HIGH);
+                digitalWrite(STEP_LIN, LOW);
+                posA--;
+
+                previousStateCLK = currentStateCLK;
+            }
+        }
+
+        // Confirm position
+        if (digitalRead(knobBtn) == LOW)
+        {
+            Serial.print("POSITION A SET: ");
+            Serial.println(posA);
+            delay(500);
+            return;
+        }
+    }
 }
+
 void selectAlpha()
 {
-  Serial.println("SELECTING ANGLE ALPHA");
-  u8x8.clear();
-  u8x8.drawString(0,0,"Set Start Angle:");
-  value = 2;
-  counter = 4;
-  while(1)
-  {
-     panDriver.microsteps (16);
-      //Serial.println("waiting");
-     currentStateCLK = digitalRead(knobCLK);
-    
-    if (currentStateCLK != previousStateCLK)
-    {
-      currentState();
-    }
-    previousStateCLK = currentStateCLK;
+    Serial.println("SELECTING ANGLE ALPHA");
 
-//CLOCKWISE    
-  if(value == 1)
-  {
-    u8x8.clearLine(2);
-    u8x8.clearLine(3);
-    u8x8.drawString(0,2,"Clockwise");
-  }
-  while(value == 1)
-  {
-    panDriver.shaft(false);
-    currentStateCLK = digitalRead(knobCLK);
-    
-    if (currentStateCLK != previousStateCLK)
-    {
-      currentState();
-    }
+    panDriver.microsteps(16);  // Coarse step control for setup
 
-    
-    digitalWrite(STEP_PAN, HIGH);
-    digitalWrite(STEP_PAN, LOW);
-
-    
-    alpha++;
-    previousStateCLK = currentStateCLK;
-  }
-
-//COUNTER CLOCKWISE
-  if(value == 3)
-  {
-    u8x8.clearLine(2);
-    u8x8.clearLine(3);
-    u8x8.drawString(0,2,"Anti-Clockwise");
-  }
-  while(value == 3)
-  {
-    panDriver.shaft(true);
-    currentStateCLK = digitalRead(knobCLK);
-    
-    if (currentStateCLK != previousStateCLK)
-    {
-      currentState();
-    }
-
-    
-    digitalWrite(STEP_PAN, HIGH);
-    digitalWrite(STEP_PAN, LOW);
-
-
-    
-    alpha--; 
-    previousStateCLK = currentStateCLK;
-  }
-  if (digitalRead(A0) == 0)
-  { 
-      Serial.print("ANGLE ALPHA: "); Serial.println(alpha);
-      delay(500);
-      posA = posA*128;
-      alpha=alpha*16;
-      //selectA();
     u8x8.clear();
-    u8x8.drawString(0,0,"MOVING");
-    //moveMode();/////////////////////////////////
-    return(0);
-    }
-  }
+    u8x8.drawString(0, 0, "Set Start Angle:");
 
+    value = 2;
+    counter = value * 2;
+
+    while (true)
+    {
+        currentStateCLK = digitalRead(knobCLK);
+
+        if (currentStateCLK != previousStateCLK)
+        {
+            currentState();
+        }
+
+        previousStateCLK = currentStateCLK;
+
+        // Clockwise rotation
+        if (value == 1)
+        {
+            u8x8.clearLine(2);
+            u8x8.drawString(0, 2, "Clockwise");
+
+            panDriver.shaft(false);
+
+            while (value == 1)
+            {
+                currentStateCLK = digitalRead(knobCLK);
+                if (currentStateCLK != previousStateCLK)
+                {
+                    currentState();
+                }
+
+                digitalWrite(STEP_PAN, HIGH);
+                digitalWrite(STEP_PAN, LOW);
+                alpha++;
+
+                previousStateCLK = currentStateCLK;
+            }
+        }
+
+        // Counter-clockwise rotation
+        if (value == 3)
+        {
+            u8x8.clearLine(2);
+            u8x8.drawString(0, 2, "Anti-Clockwise");
+
+            panDriver.shaft(true);
+
+            while (value == 3)
+            {
+                currentStateCLK = digitalRead(knobCLK);
+                if (currentStateCLK != previousStateCLK)
+                {
+                    currentState();
+                }
+
+                digitalWrite(STEP_PAN, HIGH);
+                digitalWrite(STEP_PAN, LOW);
+                alpha--;
+
+                previousStateCLK = currentStateCLK;
+            }
+        }
+
+        // Confirm angle set
+        if (digitalRead(knobBtn) == LOW)
+        {
+            Serial.print("ANGLE ALPHA SET: ");
+            Serial.println(alpha);
+
+            // Normalize units for step resolution
+            posA *= 128;
+            alpha *= 16;
+
+            delay(500);
+            u8x8.clear();
+            u8x8.drawString(0, 0, "MOVING");
+
+            return;
+        }
+    }
 }
+
 void selectSpeed()
 {
-  //u8x8.setFont(u8x8_font_8x13_1x2_f); 
-  Serial.println("speed select");
-  u8x8.clear();
-  u8x8.drawString(0,0,"Select Speed:");
-  
-  counter = 170;
-  value = counter/2;
-  prevValue = 0;
-  while(1)
-  {
-    currentStateCLK = digitalRead(knobCLK);
-     
-    if (currentStateCLK != previousStateCLK)
-    {
-      if(digitalRead(knobDT) == currentStateCLK)
-      {
-          counter++;
-      }  
-      if(digitalRead(knobDT) != currentStateCLK)
-      { 
-          counter--;
-      }
-      value = counter / 2;
+    Serial.println("SELECTING SPEED");
 
-      if(value < 1)
-      {
-        counter = 1 * 2;
-        value = counter / 2;
-      }
-      if(value >= 100)
-      {
-        counter = 100 * 2;
-        value = counter / 2;
-      }
-      //Serial.print("Value: ");  Serial.println(value);
-    }
-    previousStateCLK = currentStateCLK;
+    const int SPEED_MIN = 1;
+    const int SPEED_MAX = 100;
 
-    if(value!= prevValue)
+    u8x8.clear();
+    u8x8.drawString(0, 0, "Select Speed:");
+
+    counter = SPEED_MAX * 2; //starts at 100
+    prevValue = 0;
+
+    while (true)
     {
-      u8x8.clearLine(2);
-      u8x8.clearLine(3);
-      u8x8.setCursor(0,2);
-      u8x8.print(value);
+        currentStateCLK = digitalRead(knobCLK);
+
+        if (currentStateCLK != previousStateCLK)
+        {
+            if (digitalRead(knobDT) == currentStateCLK)
+            {
+                counter++;
+            }
+            else
+            {
+                counter--;
+            }
+
+            value = constrain(counter / 2, SPEED_MIN, SPEED_MAX);
+            counter = value * 2;
+        }
+
+        previousStateCLK = currentStateCLK;
+
+        if (value != prevValue)
+        {
+            u8x8.clearLine(2);
+            u8x8.setCursor(0, 2);
+            u8x8.print(value);
+            prevValue = value;
+        }
+
+        if (digitalRead(knobBtn) == LOW)
+        {
+            delay(500);  // Debounce
+            int speedSelect = value;
+            del = (100 - speedSelect) * 40;  // Delay in microseconds
+            Serial.print("SPEED SELECTED: ");
+            Serial.println(speedSelect);
+            return;
+        }
     }
-    prevValue = value;
-    if (digitalRead(A0) == 0)
-    { 
-      delay(500);
-      speedSelect = value;
-      del = (100 - speedSelect)*40;
-      return(0);
-    }
-  }
-   speedSelect = value;
-  //del = ((100 - speedSelect) * 2) + 5;
-  del = 0;
-  return(0);
 }
+
 void selectTime()
 {
-  //u8x8.setFont(u8x8_font_8x13_1x2_f); 
-  Serial.println("speed time");
-  u8x8.clear();
-  u8x8.drawString(0,0,"Hours to Lapse:");
-  counter = 0;
-  value = 0;
-  value = prevValue;
-  prevValue = 0;
-  while(1)
-  {
-    currentStateCLK = digitalRead(knobCLK);
-     
-    if (currentStateCLK != previousStateCLK)
-    {
-      if(digitalRead(knobDT) == currentStateCLK)
-      {
-          counter++;
-      }  
-      if(digitalRead(knobDT) != currentStateCLK)
-      { 
-          counter--;
-      }
-      value = counter / 2;
+    Serial.println("SELECTING TIME TO LAPSE");
 
-      if(value < 1)
-      {
-        counter = 1 * 2;
-        value = counter / 2;
-      }
-      if(value >= 100)
-      {
-        counter = 100 * 2;
-        value = counter / 2;
-      }
-      //Serial.print("Value: ");  Serial.println(value);
-    }
-    previousStateCLK = currentStateCLK;
+    const int TIME_MIN = 1;
+    const int TIME_MAX = 100;
+    const float TIME_STEP_HOURS = 0.25;
 
-    if(value!= prevValue)
+    u8x8.clear();
+    u8x8.drawString(0, 0, "Hours to Lapse:");
+
+    counter = 0;
+    value = 0;
+    prevValue = 0;
+
+    while (true)
     {
-      hours = (float)value * 0.25;
-      u8x8.clearLine(2);
-      u8x8.clearLine(3);
-      u8x8.setCursor(0,2);
-      u8x8.print(hours);
+        currentStateCLK = digitalRead(knobCLK);
+
+        if (currentStateCLK != previousStateCLK)
+        {
+            if (digitalRead(knobDT) == currentStateCLK)
+            {
+                counter++;
+            }
+            else
+            {
+                counter--;
+            }
+
+            value = constrain(counter / 2, TIME_MIN, TIME_MAX);
+            counter = value * 2;
+        }
+
+        previousStateCLK = currentStateCLK;
+
+        if (value != prevValue)
+        {
+            hours = value * TIME_STEP_HOURS;
+
+            u8x8.clearLine(2);
+            u8x8.setCursor(0, 2);
+            u8x8.print(hours);
+
+            prevValue = value;
+        }
+
+        if (digitalRead(knobBtn) == LOW)
+        {
+            delay(500);  // Debounce
+
+            long totalMicros = static_cast<long>(0.9 * hours * 3600000000.0);
+            del = totalMicros / abs(posA);  // delay per step
+
+            Serial.print("TOTAL HOURS: ");
+            Serial.println(hours);
+            Serial.print("STEP DELAY (us): ");
+            Serial.println(del);
+            return;
+        }
     }
-    prevValue = value;
-    if (digitalRead(A0) == 0)
-    { 
-      delay(500);
-      Serial.println(posA);
-      del = round(0.9* hours * (float)3600000000)/((float)abs(posA));
-      Serial.print("delay: "); Serial.println(del);
-      Serial.print("overall delay "); Serial.println(del*abs(posA));
-      return(0);
-    }
-  }
-  return(0);
 }
+
 void moveMode()
 {
-  u8x8.clear();
-  u8x8.drawString(0,0,"Calculating...");
-  u8x8.clearLine(2);
-  u8x8.clearLine(3);
-  u8x8.drawString(0,2,"Please Wait...");
-  
-  multiplier1 = 0;
-  multiplier2 = 0;
-  multiplier3 = 0;
-  multiplier4 = 0;
-  multiplier5 = 0;
-  
-  linearDriver.microsteps (128);
-  panDriver.microsteps (256);
-  Serial.println(posA);
-  Serial.println(alpha);
-  if(posA > 0)
-  {
-    linearDriver.shaft(false);
-  }
-  else
-  {
-    linearDriver.shaft(true);
-  }
-
-  if(alpha > 0)
-  {
-    Serial.println(alpha);
-    panDriver.shaft(true);
-  }
-  else
-  {
-    Serial.println(alpha);
-    panDriver.shaft(false);
-  }
-  posA = abs(posA);
-  alpha = abs(alpha);
-
-  if (posA > alpha)
-  {
-    stepsLeft = alpha;
-    //Serial.print("Actual Multiplier: "); Serial.println((((float)abs(posA )) / ((float)alpha)));
-  
-    if(stepsLeft > 0)
-    {
-      multiplier1 = (1 + (posA / alpha));
-      Serial.print("Multiplier1: ");Serial.println(multiplier1);
-      //stepsLeft = posA;
-      for(i = 0; i < posA; i++)
-      {
-        if(i % multiplier1 == 0)
-        {
-          stepsDone++;
-        }
-      }
-      stepsLeft = stepsLeft - stepsDone;
-      Serial.print("STEPS DONE: "); Serial.println(stepsDone);
-      Serial.print("STEPS LEFT: "); Serial.println(stepsLeft);
-    }
-  
-    if(stepsLeft > 0)
-    {
-      multiplier2 = (1 + (posA / stepsLeft)); 
-      Serial.print("Multiplier2: ");Serial.println(multiplier2);
-      for(i = 0; i < posA; i++)
-      {
-        if(i % multiplier2 == 0)
-        {
-          stepsDone++;
-        }
-      }
-      stepsLeft = alpha - stepsDone;
-      Serial.print("STEPS DONE3: "); Serial.println(stepsDone); 
-      Serial.print("STEPS LEFT3: "); Serial.println(stepsLeft);
-    }
-    
-    if(stepsLeft > 0)
-    {
-      multiplier3 = (1 + (posA / stepsLeft)); 
-      Serial.print("Multiplier3: ");Serial.println(multiplier3);
-      for(i = 0; i < posA; i++)
-      {
-        if(i % multiplier3 == 0)
-        {
-          stepsDone++;
-        }
-      }
-      stepsLeft = alpha - stepsDone;
-      Serial.print("STEPS DONE4: "); Serial.println(stepsDone); 
-      Serial.print("STEPS LEFT4: "); Serial.println(stepsLeft);
-    }
-  
-    if(stepsLeft > 0)
-    {
-      multiplier4 = (1 + (posA / stepsLeft)); 
-      Serial.print("Multiplier4: ");Serial.println(multiplier4);
-      for(i = 0; i < posA; i++)
-      {
-        if(i % multiplier4 == 0)
-        {
-          stepsDone++;
-        }
-      }
-      stepsLeft = alpha - stepsDone;
-      Serial.print("STEPS DONE5: "); Serial.println(stepsDone); 
-      Serial.print("STEPS LEFT5: "); Serial.println(stepsLeft);
-    }
-  
-    if(stepsLeft > 0)
-    {
-      multiplier5 = (1 + (posA / stepsLeft)); 
-      Serial.print("Multiplier5: ");Serial.println(multiplier5);
-      for(i = 0; i < posA; i++)
-      {
-        if(i % multiplier5 == 0)
-        {
-          stepsDone++;
-        }
-      }
-      stepsLeft = alpha - stepsDone;
-      Serial.print("STEPS DONE2: "); Serial.println(stepsDone); 
-      Serial.print("STEPS LEFT2: "); Serial.println(stepsLeft);
-    }
-    //int multiplier3 = (1 + (posA/(alpha - ((alpha/multiplier2)*(((float)abs(posA )) / ((float)alpha))))));
-    //Serial.print("Multiplier3: ");Serial.println(multiplier3);
-      
-      
     u8x8.clear();
-    u8x8.drawString(0,0,"Now Executing");
-    u8x8.clearLine(2);
-    u8x8.clearLine(3);
-    u8x8.drawString(0,2,"Smooth Move");
-  //  timingO = millis();
-  //  Serial.print("timingO: "); Serial.println(timingO);
-    for(i = 0; i <= posA; i++)
+    u8x8.drawString(0, 0, "Calculating...");
+    u8x8.drawString(0, 2, "Please Wait...");
+
+    linearDriver.microsteps(128);
+    panDriver.microsteps(256);
+
+    Serial.print("posA: "); Serial.println(posA);
+    Serial.print("alpha: "); Serial.println(alpha);
+
+    // Determine shaft directions
+    linearDriver.shaft(posA <= 0);  // false = forward, true = reverse
+    panDriver.shaft(alpha > 0);     // true = reverse (angle increases)
+
+    posA = abs(posA);
+    alpha = abs(alpha);
+
+    long primarySteps = max(posA, alpha);
+    long secondarySteps = min(posA, alpha);
+    bool linearIsPrimary = (posA >= alpha);
+
+    int multipliers[5] = {0};
+    long stepsDone = 0;
+    long stepsLeft = secondarySteps;
+
+    // Compute up to 5 multipliers to approximate step blending
+    for (int m = 0; m < 5 && stepsLeft > 0; ++m)
     {
-  
-      while((i%multiplier1 != 0)&&(i % multiplier2 != 0)&&(i % multiplier3 != 0)&&(i % multiplier4 != 0)&&(i % multiplier5 != 0)&&(i <= posA))
-      {
-        delayMicroseconds(del);
-        digitalWrite(STEP_LIN, HIGH);
-        digitalWrite(STEP_LIN, LOW);
-        //stepLin++;
-        i++;
-      }
-      if(i%multiplier1 == 0)
-      {
-        //Serial.println(1);
-        digitalWrite(STEP_PAN, HIGH);
-        digitalWrite(STEP_PAN, LOW);
-        //stepPan++;
-      }
-      if(i%multiplier2 == 0)
-      {
-        //Serial.println(2);
-        digitalWrite(STEP_PAN, HIGH);
-        digitalWrite(STEP_PAN, LOW);
-        //stepPan++;
-      }
-      if(i%multiplier3 == 0)
-      {
-        //Serial.println(3);
-        digitalWrite(STEP_PAN, HIGH);
-        digitalWrite(STEP_PAN, LOW);
-        //stepPan++;
-      }
-      if(i%multiplier4 == 0)
-      {
-        //Serial.println(4);
-        digitalWrite(STEP_PAN, HIGH);
-        digitalWrite(STEP_PAN, LOW);
-        //stepPan++;
-      }
-      if(i%multiplier5 == 0)
-      {
-        //Serial.println(5);
-        digitalWrite(STEP_PAN, HIGH);
-        digitalWrite(STEP_PAN, LOW);
-        //stepPan++;
-      }
-  
-      digitalWrite(STEP_LIN, HIGH);
-      digitalWrite(STEP_LIN, LOW);
-      //stepLin++;
-      delayMicroseconds(del);
-      
-    }
-    //Serial.println(i);
-    Serial.println("DONE");
-    //Serial.print("LINEAR STEPS NEEDED: "); Serial.print(posA);Serial.print("   LINEAR STEPS DONE: "); Serial.println(stepLin);
-    //Serial.print("PAN STEPS NEEDED: "); Serial.print(alpha);Serial.print("   PAN STEPS DONE: "); Serial.println(stepPan);
-    Serial.print("millis now: "); Serial.println(millis());
-   // timingN = (millis() - timingO);
-   // Serial.print("time elapsed: "); Serial.println(timingN);
-    //while(1);
-    //return(0);
-    selectMode();
-  }
-  
-  else
-  {
-    stepsLeft = posA;
-    //Serial.print("Actual Multiplier: "); Serial.println((((float)abs(posA )) / ((float)alpha)));
-  
-    if(stepsLeft > 0)
-    {
-      multiplier1 = (1 + (alpha / posA));
-      Serial.print("Multiplier1: ");Serial.println(multiplier1);
-      //stepsLeft = posA;
-      for(i = 0; i < alpha; i++)
-      {
-        if(i % multiplier1 == 0)
+        multipliers[m] = 1 + (primarySteps / stepsLeft);
+        for (long i = 0; i < primarySteps; ++i)
         {
-          stepsDone++;
+            if (i % multipliers[m] == 0)
+            {
+                stepsDone++;
+            }
         }
-      }
-      stepsLeft = stepsLeft - stepsDone;
-      Serial.print("STEPS DONE: "); Serial.println(stepsDone);
-      Serial.print("STEPS LEFT: "); Serial.println(stepsLeft);
+        stepsLeft = secondarySteps - stepsDone;
+        Serial.print("Multiplier "); Serial.print(m + 1); Serial.print(": ");
+        Serial.println(multipliers[m]);
     }
-  
-    if(stepsLeft > 0)
-    {
-      multiplier2 = (1 + (alpha / stepsLeft)); 
-      Serial.print("Multiplier2: ");Serial.println(multiplier2);
-      for(i = 0; i < alpha; i++)
-      {
-        if(i % multiplier2 == 0)
-        {
-          stepsDone++;
-        }
-      }
-      stepsLeft = posA - stepsDone;
-      Serial.print("STEPS DONE3: "); Serial.println(stepsDone); 
-      Serial.print("STEPS LEFT3: "); Serial.println(stepsLeft);
-    }
-    
-    if(stepsLeft > 0)
-    {
-      multiplier3 = (1 + (alpha / stepsLeft)); 
-      Serial.print("Multiplier3: ");Serial.println(multiplier3);
-      for(i = 0; i < alpha; i++)
-      {
-        if(i % multiplier3 == 0)
-        {
-          stepsDone++;
-        }
-      }
-      stepsLeft = posA - stepsDone;
-      Serial.print("STEPS DONE4: "); Serial.println(stepsDone); 
-      Serial.print("STEPS LEFT4: "); Serial.println(stepsLeft);
-    }
-  
-    if(stepsLeft > 0)
-    {
-      multiplier4 = (1 + (alpha / stepsLeft)); 
-      Serial.print("Multiplier4: ");Serial.println(multiplier4);
-      for(i = 0; i < alpha; i++)
-      {
-        if(i % multiplier4 == 0)
-        {
-          stepsDone++;
-        }
-      }
-      stepsLeft = posA - stepsDone;
-      Serial.print("STEPS DONE5: "); Serial.println(stepsDone); 
-      Serial.print("STEPS LEFT5: "); Serial.println(stepsLeft);
-    }
-  
-    if(stepsLeft > 0)
-    {
-      multiplier5 = (1 + (alpha / stepsLeft)); 
-      Serial.print("Multiplier5: ");Serial.println(multiplier5);
-      for(i = 0; i < alpha; i++)
-      {
-        if(i % multiplier5 == 0)
-        {
-          stepsDone++;
-        }
-      }
-      stepsLeft = posA - stepsDone;
-      Serial.print("STEPS DONE2: "); Serial.println(stepsDone); 
-      Serial.print("STEPS LEFT2: "); Serial.println(stepsLeft);
-    }
-    //int multiplier3 = (1 + (posA/(alpha - ((alpha/multiplier2)*(((float)abs(posA )) / ((float)alpha))))));
-    //Serial.print("Multiplier3: ");Serial.println(multiplier3);
-      
-      
+
     u8x8.clear();
-    u8x8.drawString(0,0,"Now Executing");
-    u8x8.clearLine(2);
-    u8x8.clearLine(3);
-    u8x8.drawString(0,2,"Smooth Move");
-  //  timingO = millis();
-  //  Serial.print("timingO: "); Serial.println(timingO);
-    for(i = 0; i <= alpha; i++)
+    u8x8.drawString(0, 0, "Now Executing");
+    u8x8.drawString(0, 2, "Smooth Move");
+
+    // Execute move: primary axis steps every iteration, secondary axis steps based on multipliers
+    for (long i = 0; i <= primarySteps; ++i)
     {
-  
-      while((i%multiplier1 != 0)&&(i % multiplier2 != 0)&&(i % multiplier3 != 0)&&(i % multiplier4 != 0)&&(i % multiplier5 != 0)&&(i <= alpha))
-      {
+        bool shouldStepSecondary = false;
+        for (int m = 0; m < 5; ++m)
+        {
+            if (multipliers[m] > 0 && i % multipliers[m] == 0)
+            {
+                shouldStepSecondary = true;
+                break;
+            }
+        }
+
+        if (linearIsPrimary)
+        {
+            // Step linear motor always
+            digitalWrite(STEP_LIN, HIGH); digitalWrite(STEP_LIN, LOW);
+
+            // Step pan motor conditionally
+            if (shouldStepSecondary)
+            {
+                digitalWrite(STEP_PAN, HIGH); digitalWrite(STEP_PAN, LOW);
+            }
+        }
+        else
+        {
+            // Step pan motor always
+            digitalWrite(STEP_PAN, HIGH); digitalWrite(STEP_PAN, LOW);
+
+            // Step linear motor conditionally
+            if (shouldStepSecondary)
+            {
+                digitalWrite(STEP_LIN, HIGH); digitalWrite(STEP_LIN, LOW);
+            }
+        }
+
         delayMicroseconds(del);
-        digitalWrite(STEP_PAN, HIGH);
-        digitalWrite(STEP_PAN, LOW);
-        //stepLin++;
-        i++;
-      }
-      if(i%multiplier1 == 0)
-      {
-        //Serial.println(1);
-        digitalWrite(STEP_LIN, HIGH);
-        digitalWrite(STEP_LIN, LOW);
-        //stepPan++;
-      }
-      if(i%multiplier2 == 0)
-      {
-        //Serial.println(2);
-        digitalWrite(STEP_LIN, HIGH);
-        digitalWrite(STEP_LIN, LOW);
-        //stepPan++;
-      }
-      if(i%multiplier3 == 0)
-      {
-        //Serial.println(3);
-        digitalWrite(STEP_LIN, HIGH);
-        digitalWrite(STEP_LIN, LOW);
-        //stepPan++;
-      }
-      if(i%multiplier4 == 0)
-      {
-        //Serial.println(4);
-        digitalWrite(STEP_LIN, HIGH);
-        digitalWrite(STEP_LIN, LOW);
-        //stepPan++;
-      }
-      if(i%multiplier5 == 0)
-      {
-        //Serial.println(5);
-        digitalWrite(STEP_LIN, HIGH);
-        digitalWrite(STEP_LIN, LOW);
-        //stepPan++;
-      }
-  
-      digitalWrite(STEP_PAN, HIGH);
-      digitalWrite(STEP_PAN, LOW);
-//      stepLin++;
-      delayMicroseconds(del);
-      
     }
-    //Serial.println(i);
-//      Serial.println("DONE");
-//      Serial.print("LINEAR STEPS NEEDED: "); Serial.print(posA);Serial.print("   LINEAR STEPS DONE: "); Serial.println(stepLin);
-//      Serial.print("PAN STEPS NEEDED: "); Serial.print(alpha);Serial.print("   PAN STEPS DONE: "); Serial.println(stepPan);
-//      Serial.print("millis now: "); Serial.println(millis());
-   // timingN = (millis() - timingO);
-   // Serial.print("time elapsed: "); Serial.println(timingN);
-    //while(1);
-    //return(0);
-    selectMode();
-  }
+
+    Serial.println("Motion complete.");
+    selectMode();  // Return to mode selection
 }
+
